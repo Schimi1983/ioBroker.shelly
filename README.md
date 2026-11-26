@@ -246,6 +246,7 @@ See [documentation (en)](https://github.com/iobroker-community-adapters/ioBroker
 - (Schimi1983) Fixed devices behind the same IP address (e.g. range extender) disturbing each other (refers to #1737)
 - (Schimi1983) Fixed polling that could run twice for a device or continue after the device disconnected (refers to #1738)
 - (Schimi1983) CoAP listener is now stopped completely when the adapter is stopped (refers to #1739)
+- (Schimi1983) Fixed device search reporting already known devices as new (refers to #1734)
 
 ### 12.2.0-alpha.5 (2026-11-26)
 
