@@ -248,6 +248,7 @@ See [documentation (en)](https://github.com/iobroker-community-adapters/ioBroker
 - (Schimi1983) Much less HTTP polling: Gen 2+ devices read their settings only when they have changed, several values are read with one request
 - (Schimi1983) Fixed device search reporting already known devices as new
 - (Schimi1983) Firmware update notification is only sent again if another device has a new update
+- (Schimi1983) CoAP: less network traffic and device load, the device description is only requested for new devices (refers to #1643)
 
 ### 12.2.0-alpha.4 (2026-11-23)
 
