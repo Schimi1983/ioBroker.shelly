@@ -245,6 +245,7 @@ See [documentation (en)](https://github.com/iobroker-community-adapters/ioBroker
 - (Schimi1983) Fixed lost commands after a long MQTT connection with QoS 1/2
 - (Schimi1983) Fixed devices behind the same IP address (e.g. range extender) disturbing each other
 - (Schimi1983) CoAP listener is now stopped completely when the adapter is stopped
+- (Schimi1983) Much less HTTP polling: Gen 2+ devices read their settings only when they have changed, several values are read with one request
 
 ### 12.2.0-alpha.4 (2026-11-23)
 
