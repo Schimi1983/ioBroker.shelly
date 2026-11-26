@@ -1,0 +1,10 @@
+import type { DeviceDefinition } from '../../deviceTypes';
+/**
+ * Shelly Plug / SHPLG-1 / shellyplug
+ * CoAP:
+ *
+ * CoAP Version >= 1.8
+ *  Shelly Plug SHPLG-1:    {"blk":[{"I":1,"D":"relay_0"},{"I":2,"D":"device"}],"sen":[{"I":9103,"T":"EVC","D":"cfgChanged","R":"U16","L":2},{"I":1101,"T":"S","D":"output","R":"0/1","L":1},{"I":4101,"T":"P","D":"power","U":"W","R":["0/3500","-1"],"L":1},{"I":4103,"T":"E","D":"energy","U":"Wmin","R":["U32","-1"],"L":1},{"I":6102,"T":"A","D":"overpower","R":["0/1","-1"],"L":1},{"I":6109,"T":"P","D":"overpowerValue","U":"W","R":["U32","-1"],"L":1}]}
+ */
+declare const shellyplug: DeviceDefinition;
+export { shellyplug };

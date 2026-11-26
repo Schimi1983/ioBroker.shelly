@@ -1,0 +1,10 @@
+import type { DeviceDefinition } from '../../deviceTypes';
+/**
+ * Shelly Motion / SHMOS-01 / shellymotion
+ * CoAP:
+ *
+ * CoAP Version >= 1.8
+ *  Shelly Motion SHMOS-01:    {"blk":[{"I":1,"D":"sensor_0"},{"I":2,"D":"device"}],"sen":[{"I":6107,"T":"A","D":"motion","R":["0/1","-1"],"L":1},{"I":3119,"T":"S","D":"timestamp","U":"s","R":["U32","-1"],"L":1},{"I":3120,"T":"A","D":"motionActive","R":["0/1","-1"],"L":1},{"I":6110,"T":"A","D":"vibration","R":["0/1","-1"],"L":1},{"I":3106,"T":"L","D":"luminosity","R":["U32","-1"],"L":1},{"I":3111,"T":"B","D":"battery","R":["0/100","-1"],"L":2},{"I":9103,"T":"EVC","D":"cfgChanged","R":"U16","L":2}]}
+ */
+declare const shellymotionsensor: DeviceDefinition;
+export { shellymotionsensor };
