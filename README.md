@@ -239,6 +239,10 @@ See [documentation (en)](https://github.com/iobroker-community-adapters/ioBroker
   ### **WORK IN PROGRESS**
 
 -->
+### **WORK IN PROGRESS**
+
+- (Schimi1983) CoAP: less network traffic and device load, the device description is only requested for new devices (refers to #1643)
+
 ### 12.2.0-alpha.4 (2026-11-23)
 
 - (mcm1957) Added new state `mqtt.ip` to show the IP address the device has connected from
