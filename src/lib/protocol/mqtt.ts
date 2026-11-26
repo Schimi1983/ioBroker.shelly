@@ -467,6 +467,12 @@ class MQTTClient extends BaseClient {
         // Update MQTT connection state before super.destroy() triggers deviceStatusUpdate(false)
         void this.adapter.mqttConnectionUpdate(this.getDeviceId(), false);
 
+        // Forget this client - but only if it was not already replaced by a newer connection
+        const name = this.getId();
+        if (name && MQTTClient.clientlist?.[name] === this) {
+            delete MQTTClient.clientlist[name];
+        }
+
         super.destroy();
         this.adapter.log.debug(`[MQTT] Destroying`);
 
@@ -1260,8 +1266,11 @@ class MQTTClient extends BaseClient {
 export class MQTTServer extends BaseServer {
     /** The TCP server accepting MQTT connections. */
     private server: net.Server = new net.Server();
-    /** Active MQTT clients keyed by remote address. */
-    private clients: Record<string, MQTTClient> = {};
+    /**
+     * Active MQTT clients per TCP connection. Several devices can share one remote address
+     * (range extender, NAT), so the address must not be used as key.
+     */
+    private clients: Map<net.Socket, MQTTClient> = new Map();
 
     constructor(adapter: ShellyAdapter, objectHelper: ObjectHelper, eventEmitter: EventEmitter) {
         super(adapter, objectHelper, eventEmitter);
@@ -1272,7 +1281,7 @@ export class MQTTServer extends BaseServer {
             this.adapter.log.debug(`[MQTT Server] New connection from ${stream.remoteAddress}`);
 
             const client = new MQTTClient(this.adapter, this.objectHelper, this.eventEmitter, stream);
-            this.clients[stream.remoteAddress ?? ''] = client;
+            this.clients.set(stream, client);
 
             stream.on('timeout', () => {
                 this.adapter.log.debug(`[MQTT Server] Timeout for ${stream.remoteAddress} (${client.getLogInfo()})`);
@@ -1302,7 +1311,7 @@ export class MQTTServer extends BaseServer {
 
             stream.on('close', () => {
                 this.adapter.log.debug(`[MQTT Server] Close for ${stream.remoteAddress} (${client.getLogInfo()})`);
-                delete this.clients[stream.remoteAddress ?? ''];
+                this.clients.delete(stream);
             });
 
             stream.on('end', () => {
@@ -1329,18 +1338,24 @@ export class MQTTServer extends BaseServer {
      * @param deviceId ioBroker device id, e.g. `SNSN-0013A#a1b2c3#1`
      */
     getClientByDeviceId(deviceId: string): MQTTClient | undefined {
-        return Object.values(this.clients).find(client => client.getDeviceId() === deviceId);
+        for (const client of this.clients.values()) {
+            if (client.getDeviceId() === deviceId) {
+                return client;
+            }
+        }
+        return undefined;
     }
 
     destroy(): void {
         super.destroy();
         this.adapter.log.debug(`[MQTT Server] Destroying`);
 
-        for (const i in this.clients) {
-            this.clients[i]
+        for (const client of this.clients.values()) {
+            client
                 .destroy()
                 .catch((e: unknown) => this.adapter.log.error(`[MQTT Server] destroy failed: ${String(e)}`));
         }
+        this.clients.clear();
         this.server.close();
     }
 }
