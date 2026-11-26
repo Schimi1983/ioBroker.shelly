@@ -1,0 +1,1120 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MQTTServer = void 0;
+const mqtt_connection_1 = __importDefault(require("mqtt-connection"));
+const net = __importStar(require("node:net"));
+const base_1 = require("./base");
+const datapoints = __importStar(require("../datapoints"));
+const package_json_1 = require("../../../package.json");
+const INIT_SRC = 'iobroker-init';
+// Whether `funct` is an `async` function (so the caller knows to `await` its result).
+function isAsync(funct) {
+    if (typeof funct === 'function' && funct.constructor) {
+        return funct.constructor.name == 'AsyncFunction';
+    }
+    return undefined;
+}
+class MQTTClient extends base_1.BaseClient {
+    static clientlist;
+    /** The underlying TCP stream of this MQTT connection. */
+    stream;
+    /** MQTT topic prefix announced by the device (e.g. `shellyplus1-abc`). */
+    mqttprefix;
+    /** Running HTTP request for the mqtt prefix, so it is not requested several times in parallel */
+    mqttPrefixLookup;
+    /** Pending fragmented/awaited messages by id. */
+    messageCache;
+    messageId;
+    /** The MQTT "last will" packet of the device, once known. */
+    will;
+    /** True while delaying publishes right after a new connection. */
+    initializing;
+    /** Publish packets queued during initialization. */
+    publishQueue;
+    /** Commands to the device queued during initialization, because the mqtt prefix was not known yet. */
+    commandQueue;
+    /** True while the publish queue is being drained. */
+    processingQueue;
+    /** True during destruction, to stop queuing new packets. */
+    destroying;
+    /** The mqtt-connection wrapper around the stream (assigned in `start()`, called from the ctor). */
+    client;
+    /** Resolve callback for waiting until real IP is received via iobroker-init/rpc (range extender support). */
+    pendingIpFromRpcResolve;
+    /** Remote IP address of the TCP connection this MQTT client arrived on. */
+    connectIp;
+    constructor(adapter, objectHelper, eventEmitter, stream) {
+        super('mqtt', adapter, objectHelper, eventEmitter);
+        this.stream = stream;
+        this.messageCache = {};
+        this.messageId = 1;
+        this.will = undefined;
+        this.initializing = false; // use to delay publish packets after new connection
+        this.publishQueue = []; // queue for publish packets during initialization
+        this.commandQueue = []; // queue for commands to the device during initialization (mqtt prefix unknown)
+        this.processingQueue = false; // flag to indicate queue processing is in progress
+        this.destroying = false; // flag to prevent new packets from being queued during destruction
+        this.pendingIpFromRpcResolve = null;
+        this.connectIp = undefined;
+        this.start();
+    }
+    start() {
+        this.client = (0, mqtt_connection_1.default)(this.stream);
+        this.listener();
+    }
+    /**
+     * to get sure, that an instance will be start more than one, we check for running instances
+     * if an instance run with same name (shellyswitch-12345), we destroy the old instance
+     *
+     * @param self - my instance
+     */
+    static _registerRun(self) {
+        if (self) {
+            this.clientlist = this.clientlist || {};
+            const name = self.getId();
+            if (name) {
+                const previous = this.clientlist[name];
+                if (previous) {
+                    previous
+                        .destroy()
+                        .catch((e) => previous.adapter.log.error(`[MQTT] destroy failed: ${String(e)}`));
+                }
+                this.clientlist[name] = self;
+            }
+        }
+    }
+    /**
+     * @inheritdoc
+     */
+    getSerialId() {
+        if (!this.serialId) {
+            let id = this.getId();
+            if (id) {
+                id = id.replace(/(.+?)\/(.+?)\/(.*)/, '$2');
+                this.serialId = id.replace(/(.+)-(.+)/, '$2');
+            }
+        }
+        return this.serialId ?? '';
+    }
+    /**
+     * @inheritdoc
+     */
+    getDeviceClass() {
+        if (!this.deviceClass) {
+            let id = this.getId();
+            if (id) {
+                id = id.replace(/(.+?)\/(.+?)\/(.*)/, '$2');
+                this.deviceClass = id.replace(/(.+)-(.+)/, '$1');
+            }
+        }
+        return this.deviceClass ?? '';
+    }
+    /**
+     * @inheritdoc
+     */
+    getDeviceType() {
+        if (!this.deviceType) {
+            const deviceClass = this.getDeviceClass();
+            this.deviceType = datapoints.getDeviceTypeByClass(deviceClass);
+        }
+        return this.deviceType;
+    }
+    /**
+     * @inheritdoc
+     */
+    getDeviceId() {
+        if (!this.deviceId) {
+            const deviceType = this.getDeviceType();
+            const serialId = this.getSerialId();
+            if (deviceType && serialId) {
+                this.deviceId = `${deviceType}#${serialId}#1`;
+            }
+        }
+        return this.deviceId;
+    }
+    getMqttPrefix() {
+        return this.mqttprefix ?? '';
+    }
+    /**
+     * A Gen 2+ device connected through a range extender is reachable at the extender's
+     * address and a mapped port only. Ask every extender candidate that shares the remote
+     * address for its AP clients and find the entry whose IP matches the device's own IP.
+     *
+     * Uses `this.connectIp` (the TCP remote address of this device's MQTT connection) to
+     * identify range extender candidates: another Gen2+ device whose own IP equals the
+     * remote address this connection arrived from is a potential extender.
+     *
+     * @param deviceIp the device's own IP address (from Shelly.GetDeviceInfo)
+     * @returns whether an endpoint was found
+     */
+    async setRangeExtenderHttpEndpoint(deviceIp) {
+        if (this.getDeviceGen() < 2) {
+            this.adapter.log.debug(`[MQTT] executing setRangeExtenderHttpEndpoint for deviceIp ${deviceIp} - ignored for gen 1 device`);
+            return false;
+        }
+        const remoteIp = this.connectIp;
+        if (!remoteIp) {
+            this.adapter.log.debug(`[MQTT] executing setRangeExtenderHttpEndpoint for deviceIp ${deviceIp} - no remoteIp defined`);
+            return false;
+        }
+        this.adapter.log.debug(`[MQTT] executing setRangeExtenderHttpEndpoint for remoteIp ${remoteIp} / deviceIp ${deviceIp} }`);
+        const clients = MQTTClient.clientlist ?? {};
+        for (const clientId in clients) {
+            const client = clients[clientId];
+            if (!client || client === this || client.getDeviceGen() < 2 || client.getIP() !== remoteIp) {
+                continue;
+            }
+            try {
+                const body = await client.requestAsync('/rpc/WiFi.ListAPClients');
+                const apClients = JSON.parse(body)?.ap_clients ?? [];
+                const apClient = apClients.find((entry) => entry?.ip === deviceIp);
+                if (apClient?.mport > 0) {
+                    await this.setHttpEndpoint(`${remoteIp}:${apClient.mport}`, `range extender ${client.getId()}`);
+                    this.adapter.log.info(`[MQTT] Device ${this.getId()} uses range extender ${client.getId()} via ${this.getHttpEndpoint()}`);
+                    return true;
+                }
+            }
+            catch (err) {
+                this.adapter.log.debug(`[MQTT] Unable to check range extender clients of ${client.getLogInfo()} for ${this.getLogInfo()}: ${err}`);
+            }
+        }
+        return false;
+    }
+    replacePrefixIn(topic) {
+        return new String(topic).replace(new RegExp('<mqttprefix>', 'g'), this.getMqttPrefix());
+    }
+    /**
+     * Process queued publish packets sequentially
+     */
+    async processPublishQueue() {
+        // Atomic check-and-set to prevent race conditions
+        // Both operations must be synchronous (no await between them)
+        if (this.processingQueue || this.publishQueue.length === 0) {
+            return;
+        }
+        this.processingQueue = true;
+        this.adapter.log.silly(`[MQTT] Publish: ${this.getLogInfo()} - start processing ${this.publishQueue.length} queued packets`);
+        try {
+            while (this.publishQueue.length > 0) {
+                const packet = this.publishQueue.shift();
+                if (!packet) {
+                    continue;
+                }
+                try {
+                    await this.processPublishPacket(packet);
+                }
+                catch (err) {
+                    this.adapter.log.error(`[MQTT] Publish: ${this.getLogInfo()} - error processing packet: ${err && err.message ? err.message : err}`);
+                }
+            }
+        }
+        finally {
+            this.processingQueue = false;
+        }
+        this.adapter.log.silly(`[MQTT] Publish: ${this.getLogInfo()} - processing queued packets done`);
+    }
+    /**
+     * Send the commands which were queued during initialization (mqtt prefix was not known yet)
+     */
+    processCommandQueue() {
+        const commands = this.commandQueue;
+        this.commandQueue = [];
+        for (const command of commands) {
+            this.publishStateValue(command.topic, command.value);
+        }
+    }
+    /**
+     * Process a single publish packet
+     *
+     * @param packet - MQTT publish packet
+     */
+    async processPublishPacket(packet) {
+        if (this.adapter.isUnloaded) {
+            return;
+        }
+        this.adapter.log.silly(`[MQTT] Publish: ${this.getLogInfo()} - ${JSON.stringify(packet)}`);
+        if (packet.payload) {
+            this.adapter.log.debug(`[MQTT] Publish: ${this.getLogInfo()} - topic: ${packet.topic}, qos: ${packet.qos}, payload: ${packet.payload.toString()}`);
+            // Generation 1
+            if (this.getDeviceGen() === 1) {
+                if (packet.topic === 'shellies/announce') {
+                    try {
+                        const payloadObj = JSON.parse(packet.payload.toString());
+                        // Update IP address
+                        const ip = payloadObj?.ip;
+                        if (ip && ip !== this.getIP()) {
+                            await this.setIP(ip, 'Gen 1 shellies/announce');
+                            await this.adapter.deviceStatusUpdate(this.getDeviceId(), true); // Device online
+                        }
+                        // Device Mode information (new)
+                        const newDeviceMode = payloadObj?.mode;
+                        if (newDeviceMode) {
+                            await this.setDeviceMode(newDeviceMode);
+                        }
+                    }
+                    catch {
+                        // we do not change anything
+                    }
+                }
+            }
+            // Generation 2+
+            if (this.getDeviceGen() >= 2) {
+                if (packet.topic === 'iobroker/rpc') {
+                    try {
+                        const payloadObj = JSON.parse(packet.payload.toString());
+                        // Error handling for Gen 2+ devices
+                        if (payloadObj?.error) {
+                            this.adapter.log.error(`[MQTT] Received error message for ${this.getLogInfo()} - from "${payloadObj.src}": ${JSON.stringify(payloadObj.error)}`);
+                        }
+                    }
+                    catch (err) {
+                        this.adapter.log.debug(`[MQTT] Error parsing command response: ${this.getLogInfo()} - topic: ${packet.topic}, error: ${err}`);
+                    }
+                }
+                if (packet.topic === `${INIT_SRC}/rpc`) {
+                    try {
+                        const payloadObj = JSON.parse(packet.payload.toString());
+                        // Update IP address
+                        const ip = payloadObj?.result?.eth?.ip || payloadObj?.result?.wifi?.sta_ip;
+                        this.adapter.log.debug(`[MQTT] ${this.getLogInfo()} - topic: ${packet.topic} - setting ip address (ip: ${ip}, connectIp: ${this.connectIp})`);
+                        this.adapter.log.silly(`[MQTT] ${this.getLogInfo()} - ${JSON.stringify(payloadObj.result)})`);
+                        if (ip) {
+                            // Skip writing the default endpoint (ip:80) here because we may need
+                            // to use the range extender's endpoint instead - set it only once below.
+                            await this.setIP(ip, `Gen 2+ ${INIT_SRC}/rpc`, true);
+                            let rangeExtenderFound = false;
+                            if (this.connectIp && !this.connectIp.endsWith('.1') && ip !== this.connectIp) {
+                                // TODO: remove workaround to skip in Docker env
+                                rangeExtenderFound = await this.setRangeExtenderHttpEndpoint(ip);
+                            }
+                            if (!rangeExtenderFound) {
+                                await this.setHttpEndpoint(`${ip}:80`, `Gen 2+ ${INIT_SRC}/rpc`);
+                            }
+                            await this.adapter.deviceStatusUpdate(this.getDeviceId(), true); // Device online
+                        }
+                        // Unblock httpIoBrokerState() which waits for the real IP
+                        if (ip && this.pendingIpFromRpcResolve) {
+                            this.pendingIpFromRpcResolve();
+                            this.pendingIpFromRpcResolve = null;
+                        }
+                        // Device Mode information (new)
+                        if (payloadObj?.result?.profile) {
+                            const newDeviceMode = payloadObj?.result?.profile;
+                            if (newDeviceMode) {
+                                await this.setDeviceMode(newDeviceMode);
+                            }
+                        }
+                        // Firmware version (from Shelly.GetDeviceInfo response)
+                        if (payloadObj?.result?.fw_id) {
+                            await this.setDeviceFirmwareVersion(String(payloadObj.result.fw_id));
+                        }
+                    }
+                    catch (err) {
+                        this.adapter.log.debug(`[MQTT] Error parsing init command response: ${this.getLogInfo()} - topic: ${packet.topic}, error: ${err}`);
+                    }
+                }
+                // Log debug messages for Gen 2+ devices (if enabled in instance configuration)
+                if (packet.topic === `${this.getMqttPrefix()}/debug/log`) {
+                    if (this.adapter.config.logDebugMessages) {
+                        this.adapter.log.info(`[Shelly Debug Message] ${this.getLogInfo()}: ${packet.payload.toString().trim()}`);
+                    }
+                }
+            }
+        }
+        if (packet.topic !== undefined && packet.payload !== undefined) {
+            await this.createIoBrokerState(packet.topic, packet.payload);
+        }
+    }
+    /**
+     * Checks whether the running connect initialization has to be aborted.
+     *
+     * The connect handler is async, so a device can close the connection while objects are created or
+     * HTTP requests are pending - this happens regularly with battery powered devices, which disconnect
+     * right after publishing their values. In that case destroy() is already running (and waiting for
+     * this initialization), so continuing would work on a half destroyed client.
+     *
+     * @param step - name of the initialization step (for logging)
+     * @returns true if the caller has to stop the initialization
+     */
+    isInitAborted(step) {
+        if (this.destroying) {
+            this.adapter.log.debug(`[MQTT] Initialization of ${this.getLogInfo()} aborted after "${step}" - connection was closed`);
+            this.initializing = false; // let destroy() continue
+            return true;
+        }
+        return false;
+    }
+    async destroy() {
+        // Set destroying flag to prevent new packets from being queued
+        this.destroying = true;
+        // The waiting below can take up to 2 minutes - stop HTTP polling of the closed connection now
+        this.stopPolling();
+        // Wait for initialization to complete
+        if (this.initializing) {
+            this.adapter.log.debug(`[MQTT] Destroying ${this.getLogInfo()}, waiting for initialization to complete`);
+            let cnt = 5 * 60; // wait up to 60 seconds
+            while (this.initializing && cnt-- > 0) {
+                await this.adapter.delay(200);
+            }
+        }
+        // Wait for queue processing to complete
+        if (this.processingQueue) {
+            this.adapter.log.debug(`[MQTT] Destroying ${this.getLogInfo()}, waiting for queue processing to complete`);
+            let cnt = 5 * 60; // wait up to 60 seconds
+            while (this.processingQueue && cnt-- > 0) {
+                await this.adapter.delay(200);
+            }
+        }
+        // Process any remaining queued packets
+        if (this.publishQueue.length > 0) {
+            this.adapter.log.debug(`[MQTT] Destroying ${this.getLogInfo()}, processing ${this.publishQueue.length} remaining queued packets`);
+            await this.processPublishQueue();
+        }
+        // Commands queued during initialization cannot be sent anymore
+        if (this.commandQueue.length > 0) {
+            this.adapter.log.warn(`[MQTT] Connection to ${this.getLogInfo()} closed during initialization - ${this.commandQueue.length} queued commands were not sent`);
+        }
+        // Update MQTT connection state before super.destroy() triggers deviceStatusUpdate(false)
+        void this.adapter.mqttConnectionUpdate(this.getDeviceId(), false);
+        // Forget this client - but only if it was not already replaced by a newer connection
+        const name = this.getId();
+        if (name && MQTTClient.clientlist?.[name] === this) {
+            delete MQTTClient.clientlist[name];
+        }
+        super.destroy();
+        this.adapter.log.debug(`[MQTT] Destroying`);
+        for (const messageId in this.messageCache) {
+            if (this.messageCache[messageId].resendid) {
+                clearTimeout(this.messageCache[messageId].resendid);
+            }
+        }
+        this.messageCache = {};
+        this.messageId = 1;
+        this.mqttprefix = undefined;
+        this.mqttPrefixLookup = undefined;
+        this.will = undefined;
+        this.publishQueue = [];
+        this.commandQueue = [];
+        this.processingQueue = false;
+        this.connectIp = undefined;
+        if (this.client) {
+            this.client.removeAllListeners();
+            this.client.destroy();
+        }
+    }
+    /**
+     * @inheritdoc
+     */
+    publishStateValue(topic, value) {
+        if (topic.includes('<mqttprefix>') && !this.getMqttPrefix()) {
+            // The device is still initializing (prefix will be determined) - send the command afterwards
+            if (this.initializing && !this.destroying) {
+                this.adapter.log.debug(`[MQTT] Queuing message to ${this.getLogInfo()} until initialization is done (mqtt prefix not known yet): ${topic} = ${value}`);
+                this.commandQueue.push({ topic, value });
+                return;
+            }
+            this.adapter.log.warn(`[MQTT] Unable to publish message to ${this.getLogInfo()} - mqtt prefix was not set but is required for this message: ${topic} = ${value}`);
+            // The prefix is normally read once while the device connects. If that failed (e.g.
+            // because the device was busy), every command would be lost until it reconnects - so
+            // read it again in the background, the next command then works.
+            void this.setMqttPrefixHttp();
+            return;
+        }
+        topic = this.replacePrefixIn(topic);
+        const qos = Number(this.adapter.config.qos) || 0;
+        // MQTT packet identifiers are 16 bit (1..65535) - a larger id cannot be encoded and the
+        // publish fails (QoS 1/2), so wrap around instead of counting up forever.
+        // After the wrap-around an id may still belong to an unacknowledged message
+        // (messageCache) - skip those ids, otherwise a late PUBACK would remove the wrong message.
+        for (let i = 0; i < 0xffff; i++) {
+            this.messageId = (this.messageId % 0xffff) + 1;
+            if (!this.messageCache[this.messageId]) {
+                break;
+            }
+        }
+        try {
+            this.adapter.log.debug(`[MQTT] Send state to ${this.getLogInfo()} with QoS ${qos}: ${topic} = ${value} (${this.messageId})`);
+            this.client.publish({ topic: topic, payload: value, qos: qos, messageId: this.messageId });
+        }
+        catch (err) {
+            this.adapter.log.debug(`[MQTT] Unable to publish message to ${this.getLogInfo()} - received error "${err}": ${topic} = ${value}`);
+        }
+        if (qos > 0) {
+            this.deleteResendState2ClientFromTopic(topic);
+            this.resendState2Client('publish', this.messageId, {
+                topic,
+                payload: value,
+                qos,
+                dup: true,
+                messageId: this.messageId,
+            });
+        }
+    }
+    resendState2Client(cmd, messageId, message) {
+        if (messageId === undefined) {
+            return;
+        }
+        const retaintime = 5 * 1000;
+        if (!this.messageCache[messageId] ||
+            this.messageCache[messageId].cmd !== cmd ||
+            this.messageCache[messageId].message !== message) {
+            this.messageCache[messageId] = {
+                ts: Date.now(),
+                cmd,
+                count: 0,
+                message,
+            };
+        }
+        if (this.messageCache[messageId] && this.messageCache[messageId].count < 10) {
+            clearTimeout(this.messageCache[messageId].resendid);
+            this.messageCache[messageId].resendid = setTimeout(() => {
+                if (this.messageCache[messageId]) {
+                    const ts = Date.now();
+                    this.messageCache[messageId].count++;
+                    this.messageCache[messageId].ts = ts;
+                    switch (this.messageCache[messageId].cmd) {
+                        case 'publish': {
+                            const cachedMessage = this.messageCache[messageId].message;
+                            try {
+                                if (cachedMessage) {
+                                    this.client.publish(cachedMessage);
+                                }
+                            }
+                            catch (err) {
+                                this.adapter.log.debug(`[MQTT] Client communication error (publish): ${this.getLogInfo()} - error: ${err}`);
+                            }
+                            break;
+                        }
+                        case 'pubrel':
+                            try {
+                                this.client.pubrel({ messageId });
+                            }
+                            catch (err) {
+                                this.adapter.log.debug(`[MQTT] Client communication error (pubrel): ${this.getLogInfo()} - error: ${err}`);
+                            }
+                            break;
+                        case 'pubrec':
+                            try {
+                                this.client.pubrec({ messageId });
+                            }
+                            catch (err) {
+                                this.adapter.log.debug(`[MQTT] Client communication error (pubrec): ${this.getLogInfo()} - error: ${err}`);
+                            }
+                            break;
+                        case 'pubcomp':
+                            try {
+                                this.client.pubcomp({ messageId });
+                            }
+                            catch (err) {
+                                this.adapter.log.debug(`[MQTT] Client communication error (pubcomp): ${this.getLogInfo()} - error: ${err}`);
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                    this.resendState2Client(cmd, messageId, message);
+                }
+            }, retaintime);
+        }
+    }
+    deleteResendState2Client(messageId) {
+        if (messageId !== undefined && this.messageCache[messageId]) {
+            clearTimeout(this.messageCache[messageId].resendid);
+            delete this.messageCache[messageId];
+        }
+    }
+    deleteResendState2ClientFromTopic(topic) {
+        for (const messageId in this.messageCache) {
+            if (this.messageCache[messageId].message &&
+                this.messageCache[messageId].cmd === 'publish' &&
+                this.messageCache[messageId].message.topic === topic) {
+                clearTimeout(this.messageCache[messageId].resendid);
+                delete this.messageCache[messageId];
+            }
+        }
+    }
+    getCachedMessage(messageId) {
+        return messageId === undefined ? undefined : this.messageCache[messageId];
+    }
+    /**
+     * State changes from device will be saved in the ioBroker states
+     *
+     * @param topic
+     * @param payload - object can be ervery type of value
+     */
+    async createIoBrokerState(topic, payload) {
+        this.adapter.log.silly(`[MQTT] Message for ${this.getLogInfo()}: ${topic} / ${JSON.stringify(payload)} (${payload.toString()})`);
+        const dps = this.getAllTypePublishStates();
+        for (const dp of dps) {
+            const deviceId = this.getDeviceId();
+            const fullStateId = `${deviceId}.${dp.state}`;
+            const valueStr = payload.toString();
+            let value;
+            this.adapter.log.silly(`[MQTT] Message with value for ${this.getLogInfo()}: ${topic} -> state: ${fullStateId}, value: ${valueStr}`);
+            try {
+                if (this.replacePrefixIn(dp.mqtt?.mqtt_publish ?? '') === topic) {
+                    if (dp.mqtt?.mqtt_publish_funct) {
+                        value = isAsync(dp.mqtt.mqtt_publish_funct)
+                            ? await dp.mqtt.mqtt_publish_funct(valueStr, this)
+                            : dp.mqtt.mqtt_publish_funct(valueStr, this);
+                    }
+                    else {
+                        value = valueStr;
+                    }
+                    if (dp.common.type === 'boolean' && value === 'false') {
+                        value = false;
+                    }
+                    else if (dp.common.type === 'boolean' && value === 'true') {
+                        value = true;
+                    }
+                    else if (dp.common.type === 'number' && value !== undefined && value !== null) {
+                        value = Number(value);
+                    }
+                    if (Object.prototype.hasOwnProperty.call(this.device, dp.state ?? '')) {
+                        if (value !== undefined &&
+                            (!Object.prototype.hasOwnProperty.call(this.stateValueCache, fullStateId) ||
+                                this.stateValueCache[fullStateId] !== value ||
+                                this.adapter.config.updateUnchangedObjects)) {
+                            this.adapter.log.debug(`[MQTT] State change ${this.getLogInfo()}: ${topic} -> state: ${fullStateId}, value: ${JSON.stringify(value)}`);
+                            this.stateValueCache[fullStateId] = value;
+                            this.objectHelper.setOrUpdateObject(fullStateId, {
+                                type: 'state',
+                                common: dp.common,
+                            }, ['name'], value);
+                        }
+                    }
+                }
+            }
+            catch (err) {
+                this.adapter.log.error(`[MQTT] Error ${err} in function dp.mqtt.mqtt_publish_funct of state ${fullStateId} for ${this.getLogInfo()}`);
+            }
+        }
+        this.objectHelper.processObjectQueue(() => { });
+    }
+    async setMqttPrefixHttp() {
+        if (this.mqttprefix) {
+            return this.mqttprefix;
+        }
+        if (this.mqttPrefixLookup) {
+            return await this.mqttPrefixLookup;
+        }
+        this.mqttPrefixLookup = this.requestMqttPrefixHttp().finally(() => (this.mqttPrefixLookup = undefined));
+        return await this.mqttPrefixLookup;
+    }
+    /** The actual HTTP request of {@link setMqttPrefixHttp}, without the "already running" handling. */
+    async requestMqttPrefixHttp() {
+        this.adapter.log.debug(`[MQTT] Started mqttprefix fallback via HTTP for client ${this.getId()} (Gen ${this.getDeviceGen()})`);
+        if (this.getDeviceGen() == 1) {
+            try {
+                const body = await this.requestWithRetry('/settings');
+                if (body) {
+                    const settings = JSON.parse(body);
+                    this.mqttprefix = settings.mqtt.id;
+                    this.adapter.log.debug(`[MQTT] Requested mqttprefix for client ${this.getId()} (Gen 1): ${this.mqttprefix}`);
+                    return this.mqttprefix;
+                }
+            }
+            catch (err) {
+                if (err && err.response && err.response.status == 401) {
+                    this.adapter.log.error(`[MQTT] Wrong http username or http password! Please enter the user credential from restricted login for client ${this.getId()}`);
+                }
+                else {
+                    this.adapter.log.error(`[MQTT] Error in function setMqttPrefixHttp (Gen 1) for client ${this.getId()}: ${err}`);
+                }
+            }
+        }
+        else if (this.getDeviceGen() >= 2) {
+            try {
+                const body = await this.requestWithRetry('/rpc/Mqtt.GetConfig');
+                if (body) {
+                    const settings = JSON.parse(body);
+                    this.mqttprefix = settings.topic_prefix;
+                    this.adapter.log.debug(`[MQTT] Requested mqttprefix for client ${this.getId()} (Gen 2+): ${this.mqttprefix}`);
+                    return this.mqttprefix;
+                }
+            }
+            catch (err) {
+                this.adapter.log.error(`[MQTT] Error in function setMqttPrefixHttp (Gen 2+) for client ${this.getId()}: ${err}`);
+            }
+        }
+        return undefined;
+    }
+    setMqttPrefixByWill(topic) {
+        // Gen1: "shellies/huhu-shellybutton1-A4CF12F454A3/online"
+        // Gen2: "shellyplus1pm-44179394d4d4/online"
+        if (this.mqttprefix) {
+            return this.mqttprefix;
+        }
+        if (topic) {
+            const arr = topic.split('/');
+            if (this.getDeviceGen() === 1) {
+                if (arr[0] === 'shellies') {
+                    this.mqttprefix = arr[1];
+                    this.adapter.log.debug(`[MQTT] setMqttPrefixByWill (Gen 1): ${this.mqttprefix}`);
+                    return this.mqttprefix;
+                }
+            }
+            else if (this.getDeviceGen() >= 2) {
+                this.mqttprefix = arr.slice(0, -1).join('/');
+                this.adapter.log.debug(`[MQTT] setMqttPrefixByWill (Gen 2+): ${this.mqttprefix}`);
+                return this.mqttprefix;
+            }
+        }
+        return undefined;
+    }
+    listener() {
+        // client connected
+        this.client.on('connect', async (packet) => {
+            this.id = packet.clientId;
+            this.adapter.log.debug(`[MQTT] Client connected: ${JSON.stringify(packet)}`);
+            if (this.deviceExists()) {
+                this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" processing existing device`);
+                if (packet.username === this.adapter.config.mqttusername &&
+                    packet.password?.toString() === this.adapter.config.mqttpassword) {
+                    // check for existing instances
+                    MQTTClient._registerRun(this);
+                    const ip = this.stream?.remoteAddress ?? null;
+                    this.connectIp = ip ?? undefined;
+                    this.adapter.log.info(`[MQTT] Device with client id "${packet.clientId}" connected from ${ip}`);
+                    this.initializing = true;
+                    // Device Mode information (init)
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" init device mode`);
+                    await this.initDeviceModeFromState();
+                    // Firmware version information (init)
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" init firmware version`);
+                    await this.initDeviceFirmwareVersionFromState();
+                    // accept connection
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" accepting connection`);
+                    try {
+                        this.client.connack({ returnCode: 0 });
+                    }
+                    catch (err) {
+                        this.adapter.log.debug(`[MQTT] Client communication error (connack): "${packet.clientId}" - error: ${err}`);
+                        return;
+                    }
+                    // Save last will
+                    // Gen 1:  {"retain": false, "qos": 0, "topic" :"shellies/shellyswitch25-C45BBE798F0F/online", "payload": {"type":"Buffer","data": [102,97,108,115,101]}}
+                    // Gen 2+: {"retain": false, "qos": 0, "topic": "shellypro2pm-30c6f7850a64/online", "payload": {"type":"Buffer","data":[102,97,108,115,101]}}
+                    if (packet.will) {
+                        this.will = packet.will;
+                        this.adapter.log.debug(`[MQTT] Last will for client id "${packet.clientId}" saved: ${JSON.stringify(this.will)}`);
+                    }
+                    // Set the mqtt prefix before the objects are created - from then on commands can be sent
+                    if (this.will?.topic) {
+                        this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" setting mqtt prefix by last will`);
+                        this.setMqttPrefixByWill(this.will.topic);
+                    }
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" deleting old states`);
+                    await this.deleteOldStates();
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" create objects`);
+                    await this.createObjects();
+                    if (this.isInitAborted('createObjects')) {
+                        return;
+                    }
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" setting ip`);
+                    if (this.getDeviceGen() >= 2) {
+                        // For Gen 2+ devices the real IP is confirmed via iobroker-init/rpc below.
+                        // Using the MQTT remote IP here would set a wrong endpoint for relayed devices.
+                        await this.initIPFromState();
+                    }
+                    else if (ip && !String(ip).endsWith('.1')) {
+                        // TODO: remove workaround to skip in Docker env
+                        await this.setIP(ip, 'MQTT connect');
+                    }
+                    else {
+                        await this.initIPFromState();
+                    }
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" updating device status`);
+                    await this.adapter.mqttConnectionUpdate(this.getDeviceId(), true, ip ?? undefined); // MQTT connected
+                    await this.adapter.deviceStatusUpdate(this.getDeviceId(), true); // Device online
+                    // For Gen 2+ devices: query real IP via MQTT before HTTP calls.
+                    // Required for devices connected via range extender, where the MQTT remote IP is the
+                    // range extender's IP rather than the device's own IP.
+                    if (this.getDeviceGen() >= 2 && this.getMqttPrefix()) {
+                        this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" retrieving device mode information (Gen 2+)`);
+                        try {
+                            // Ask for more information (like IP address)
+                            this.publishStateValue('<mqttprefix>/rpc', JSON.stringify({
+                                id: this.getNextMsgId(),
+                                src: INIT_SRC,
+                                method: 'Shelly.GetDeviceInfo',
+                                params: { ident: true },
+                            }));
+                            this.publishStateValue('<mqttprefix>/rpc', JSON.stringify({
+                                id: this.getNextMsgId(),
+                                src: INIT_SRC,
+                                method: 'Shelly.GetStatus',
+                            }));
+                            this.publishStateValue('<mqttprefix>/command', 'status_update');
+                            // Wait until iobroker-init/rpc response with real IP arrives (or 5s timeout)
+                            await Promise.race([
+                                new Promise(resolve => {
+                                    this.pendingIpFromRpcResolve = resolve;
+                                }),
+                                new Promise(resolve => setTimeout(resolve, 5000)),
+                            ]);
+                            this.pendingIpFromRpcResolve = null;
+                        }
+                        catch (err) {
+                            this.adapter.log.debug(`[MQTT] Client communication error (publish): "${packet.clientId}" - error: ${err}`);
+                        }
+                    }
+                    this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" setting http states`);
+                    await this.httpIoBrokerState();
+                    if (this.isInitAborted('httpIoBrokerState')) {
+                        return;
+                    }
+                    // No (usable) last will - request the mqtt prefix via HTTP (requires the IP address)
+                    if (!this.getMqttPrefix()) {
+                        this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" setting mqtt prefix by HTTP`);
+                        await this.setMqttPrefixHttp();
+                    }
+                    if (!this.getMqttPrefix()) {
+                        this.adapter.log.error(`[MQTT] Unable to get mqttprefix of client with id "${packet.clientId}"`);
+                    }
+                    //this.adapter.log.silly(`[MQTT] Client id "${packet.clientId}" accepting connection`);
+                    try {
+                        //this.client.connack({ returnCode: 0 });
+                        // Device Mode information (request) - only for Gen 2+ devices without mqttprefix
+                        // (devices with mqttprefix already published these requests above before httpIoBrokerState)
+                        if (this.getDeviceGen() >= 2 && !this.getMqttPrefix()) {
+                            try {
+                                // Ask for more information (like IP address)
+                                this.publishStateValue('<mqttprefix>/rpc', JSON.stringify({
+                                    id: this.getNextMsgId(),
+                                    src: INIT_SRC,
+                                    method: 'Shelly.GetDeviceInfo',
+                                    params: { ident: true },
+                                }));
+                                this.publishStateValue('<mqttprefix>/rpc', JSON.stringify({
+                                    id: this.getNextMsgId(),
+                                    src: INIT_SRC,
+                                    method: 'Shelly.GetStatus',
+                                }));
+                                this.publishStateValue('<mqttprefix>/command', 'status_update');
+                            }
+                            catch (err) {
+                                this.adapter.log.debug(`[MQTT] Client communication error (publish): "${packet.clientId}" - error: ${err}`);
+                            }
+                        }
+                    }
+                    catch (err) {
+                        this.adapter.log.debug(`[MQTT] Client communication error (connack): "${packet.clientId}" - error: ${err}`);
+                    }
+                    this.adapter.log.info(`[MQTT] Device with client id "${packet.clientId}" initialized.`);
+                    this.initializing = false;
+                    // Send commands which were received during initialization
+                    if (this.commandQueue.length > 0) {
+                        this.adapter.log.debug(`[MQTT] Sending ${this.commandQueue.length} queued commands to ${this.getLogInfo()}`);
+                        this.processCommandQueue();
+                    }
+                    // Process any queued publish packets
+                    if (this.publishQueue.length > 0) {
+                        this.adapter.log.debug(`[MQTT] Processing ${this.publishQueue.length} queued packets for ${this.getLogInfo()}`);
+                        try {
+                            await this.processPublishQueue();
+                        }
+                        catch (err) {
+                            this.adapter.log.error(`[MQTT] Error processing publish queue for ${this.getLogInfo()}: ${err && err.message ? err.message : err}`);
+                        }
+                    }
+                }
+                else {
+                    if (packet.username === undefined) {
+                        this.adapter.log.error(`[MQTT] Wrong MQTT authentication of client "${packet.clientId}": No username transmitted by client`);
+                    }
+                    else if (packet.username !== this.adapter.config.mqttusername) {
+                        this.adapter.log.error(`[MQTT] Wrong MQTT authentication of client "${packet.clientId}": Incorrect username (expected "${this.adapter.config.mqttusername}")`);
+                    }
+                    if (packet.password === undefined) {
+                        this.adapter.log.error(`[MQTT] Wrong MQTT authentication of client "${packet.clientId}": No password transmitted by client`);
+                    }
+                    else if (packet.password?.toString() !== this.adapter.config.mqttpassword) {
+                        this.adapter.log.error(`[MQTT] Wrong MQTT authentication of client "${packet.clientId}": Incorrect password`);
+                    }
+                    try {
+                        this.client.connack({ returnCode: 4 });
+                    }
+                    catch (err) {
+                        this.adapter.log.debug(`[MQTT] Client communication error (connack): "${packet.clientId}" - error: ${err}`);
+                    }
+                }
+            }
+            else {
+                this.adapter.log.error(`[MQTT] (Shelly?) device unknown, configuration for client with id "${packet.clientId}" ${this.getLogInfo()} does not exist! Maybe this device is not supported in this adapter version (${package_json_1.version}).`);
+                this.adapter.log.error(`[MQTT] DO NOT CHANGE THE CLIENT-ID OF YOUR SHELLY DEVICES (see adapter documentation for details)`);
+                try {
+                    this.client.connack({ returnCode: 4 });
+                }
+                catch (err) {
+                    this.adapter.log.debug(`[MQTT] Client communication error (connack): "${packet.clientId}" - error: ${err}`);
+                }
+            }
+        });
+        this.client.on('close', status => {
+            // Don't reset this.initializing here - destroy() has to wait for a running initialization
+            this.adapter.log.info(`[MQTT] Client Close: ${this.getLogInfo()} (${String(status)})`);
+            this.destroy().catch((e) => this.adapter.log.error(`[MQTT] destroy failed: ${String(e)}`));
+        });
+        this.client.on('error', error => {
+            this.adapter.log.info(`[MQTT] Client Error: ${this.getLogInfo()} (${error})`);
+            // this.destroy();
+        });
+        this.client.on('disconnect', () => {
+            // Don't reset this.initializing here - destroy() has to wait for a running initialization
+            this.adapter.log.info(`[MQTT] Client Disconnect: ${this.getLogInfo()}`);
+            this.destroy().catch((e) => this.adapter.log.error(`[MQTT] destroy failed: ${String(e)}`));
+        });
+        this.client.on('timeout', () => {
+            this.adapter.log.info(`[MQTT] Client Timeout: ${this.getLogInfo()}`);
+            // this.destroy();
+        });
+        this.client.on('publish', async (packet) => {
+            if (this.adapter.isUnloaded) {
+                return;
+            }
+            // Send QoS acknowledgment immediately to avoid client timeouts
+            switch (packet.qos) {
+                case 1:
+                    this.adapter.log.silly(`[MQTT] puback: ${this.getLogInfo()}`);
+                    try {
+                        this.client.puback({ messageId: packet.messageId });
+                    }
+                    catch (err) {
+                        this.adapter.log.debug(`[MQTT] Client communication error (puback): ${this.getLogInfo()} - qos: ${packet.qos}, error: ${err}`);
+                    }
+                    break;
+                case 2:
+                    this.adapter.log.silly(`[MQTT] pubrec: ${this.getLogInfo()} - messageId: ${packet.messageId}`);
+                    try {
+                        this.client.pubrec({ messageId: packet.messageId });
+                        this.resendState2Client('pubrec', packet.messageId);
+                    }
+                    catch (err) {
+                        this.adapter.log.debug(`[MQTT] Client communication error (pubrec): ${this.getLogInfo()} - qos: ${packet.qos}, error: ${err}`);
+                    }
+                    break;
+                default:
+                    break;
+            }
+            // Don't queue packets if we're being destroyed
+            if (this.destroying) {
+                this.adapter.log.debug(`[MQTT] Publish: ${this.getLogInfo()} - destruction in progress, ignoring packet`);
+                return;
+            }
+            // Always queue packets to ensure they are processed in order
+            this.publishQueue.push(packet);
+            // Start processing queue if not already processing
+            if (!this.processingQueue && !this.initializing) {
+                await this.processPublishQueue();
+            }
+        });
+        // this.client pinged
+        this.client.on('pingreq', () => {
+            try {
+                this.client.pingresp();
+            }
+            catch (err) {
+                this.adapter.log.debug(`[MQTT] Client communication error (pingresp): ${this.getLogInfo()} - error: ${err}`);
+            }
+        });
+        // response for QoS2
+        this.client.on('pubrec', packet => {
+            const qosmsg = this.getCachedMessage(packet.messageId);
+            if (qosmsg && qosmsg.cmd === 'publish') {
+                try {
+                    this.client.pubrel({ messageId: packet.messageId });
+                    this.resendState2Client('pubrel', packet.messageId);
+                }
+                catch (err) {
+                    this.adapter.log.debug(`[MQTT] Client communication error (pubrel): ${this.getLogInfo()} - error: ${err}`);
+                }
+            }
+            else {
+                this.adapter.log.info(`[MQTT] Client ${this.getLogInfo()} received pubrec for unknown messageId: ${packet.messageId}`);
+            }
+        });
+        // response for QoS2
+        this.client.on('pubcomp', packet => {
+            const qosmsg = this.getCachedMessage(packet.messageId);
+            if (qosmsg && qosmsg.cmd === 'pubrec') {
+                this.deleteResendState2Client(packet.messageId);
+            }
+            else {
+                this.adapter.log.info(`[MQTT] Client ${this.getLogInfo()} received pubcomp for unknown messageId: ${packet.messageId}`);
+            }
+        });
+        // response for QoS2
+        this.client.on('pubrel', packet => {
+            const qosmsg = this.getCachedMessage(packet.messageId);
+            if (qosmsg && qosmsg.cmd === 'pubrec') {
+                try {
+                    this.deleteResendState2Client(packet.messageId);
+                    this.client.pubcomp({ messageId: packet.messageId });
+                }
+                catch (err) {
+                    this.adapter.log.debug(`[MQTT] Client communication error (pubcomp): ${this.getLogInfo()} - error: ${err}`);
+                }
+            }
+            else {
+                this.adapter.log.info(`[MQTT] Client ${this.getLogInfo()} received pubrel for unknown messageId: ${packet.messageId}`);
+            }
+        });
+        // response for QoS1
+        this.client.on('puback', packet => {
+            // remove this message from queue
+            const qosmsg = this.getCachedMessage(packet.messageId);
+            if (qosmsg && qosmsg.cmd === 'publish') {
+                this.deleteResendState2Client(packet.messageId);
+            }
+            else {
+                this.adapter.log.info(`[MQTT] Client ${this.getLogInfo()} received puback for unknown messageId: ${packet.messageId}`);
+            }
+        });
+        this.client.on('unsubscribe', packet => {
+            this.adapter.log.debug(`[MQTT] Unsubscribe ${this.getLogInfo()}: ${JSON.stringify(packet)}`);
+            try {
+                this.client.unsuback({ messageId: packet.messageId });
+            }
+            catch (err) {
+                this.adapter.log.debug(`[MQTT] Client communication error (unsuback): ${this.getLogInfo()} - error: ${err}`);
+            }
+        });
+        // this.client subscribed
+        this.client.on('subscribe', packet => {
+            // send a suback with messageId and granted QoS level
+            this.adapter.log.debug(`[MQTT] Subscribe ${this.getLogInfo()}: ${JSON.stringify(packet)}`);
+            const granted = [];
+            for (const subscription of packet.subscriptions ?? []) {
+                granted.push(subscription.qos);
+            }
+            if (packet.topic) {
+                this.adapter.log.debug(`[MQTT] Subscribe topic ${this.getLogInfo()}: ${packet.topic}`);
+            }
+            try {
+                this.client.suback({ granted: granted, messageId: packet.messageId });
+            }
+            catch (err) {
+                this.adapter.log.debug(`[MQTT] Client communication error (suback): ${this.getLogInfo()} - error: ${err}`);
+            }
+        });
+    }
+}
+class MQTTServer extends base_1.BaseServer {
+    /** The TCP server accepting MQTT connections. */
+    server = new net.Server();
+    /**
+     * Active MQTT clients per TCP connection. Several devices can share one remote address
+     * (range extender, NAT), so the address must not be used as key.
+     */
+    clients = new Map();
+    constructor(adapter, objectHelper, eventEmitter) {
+        super(adapter, objectHelper, eventEmitter);
+    }
+    listen() {
+        this.server.on('connection', stream => {
+            this.adapter.log.debug(`[MQTT Server] New connection from ${stream.remoteAddress}`);
+            const client = new MQTTClient(this.adapter, this.objectHelper, this.eventEmitter, stream);
+            this.clients.set(stream, client);
+            stream.on('timeout', () => {
+                this.adapter.log.debug(`[MQTT Server] Timeout for ${stream.remoteAddress} (${client.getLogInfo()})`);
+                client
+                    .destroy()
+                    .catch((e) => this.adapter.log.error(`[MQTT Server] destroy failed: ${String(e)}`));
+                stream.destroy();
+            });
+            stream.on('unload', () => {
+                this.adapter.log.debug(`[MQTT Server] Unload for ${stream.remoteAddress} (${client.getLogInfo()})`);
+                client
+                    .destroy()
+                    .catch((e) => this.adapter.log.error(`[MQTT Server] destroy failed: ${String(e)}`));
+                stream.destroy();
+            });
+            stream.on('error', () => {
+                this.adapter.log.debug(`[MQTT Server] Error for ${stream.remoteAddress} (${client.getLogInfo()})`);
+                if (client) {
+                    client
+                        .destroy()
+                        .catch((e) => this.adapter.log.error(`[MQTT Server] destroy failed: ${String(e)}`));
+                    stream.destroy();
+                }
+            });
+            stream.on('close', () => {
+                this.adapter.log.debug(`[MQTT Server] Close for ${stream.remoteAddress} (${client.getLogInfo()})`);
+                this.clients.delete(stream);
+            });
+            stream.on('end', () => {
+                this.adapter.log.debug(`[MQTT Server] End for ${stream.remoteAddress} (${client.getLogInfo()})`);
+                stream.end();
+            });
+        });
+        this.server.on('close', () => this.adapter.log.debug(`[MQTT Server] Closing listener`));
+        this.server.on('error', error => this.adapter.log.debug(`[MQTT Server] Error in listener: ${error}`));
+        this.server.listen(this.adapter.config.port, this.adapter.config.bind, undefined, () => this.adapter.log.debug(`[MQTT Server] Started listener on ${this.adapter.config.bind}:${this.adapter.config.port}`));
+    }
+    /**
+     * Find the connected client of a device, e.g. to perform an HTTP request with the credentials
+     * and the IP address known by the client.
+     *
+     * @param deviceId ioBroker device id, e.g. `SNSN-0013A#a1b2c3#1`
+     */
+    getClientByDeviceId(deviceId) {
+        for (const client of this.clients.values()) {
+            // a client which is being destroyed stays in the map until its socket is closed -
+            // after a reconnect the new connection of the device is the right one
+            if (client.getDeviceId() === deviceId && !client.destroying) {
+                return client;
+            }
+        }
+        return undefined;
+    }
+    destroy() {
+        super.destroy();
+        this.adapter.log.debug(`[MQTT Server] Destroying`);
+        for (const client of this.clients.values()) {
+            client
+                .destroy()
+                .catch((e) => this.adapter.log.error(`[MQTT Server] destroy failed: ${String(e)}`));
+        }
+        this.clients.clear();
+        this.server.close();
+    }
+}
+exports.MQTTServer = MQTTServer;
+//# sourceMappingURL=mqtt.js.map
