@@ -836,11 +836,12 @@ export class BaseClient implements ShellyClient {
     }
 
     /**
-     * Get the response for a poll url. Single component requests of Gen 2+ devices are answered
-     * from one combined request per cycle: `/rpc/Switch.GetConfig?id=0` from `Shelly.GetConfig`
-     * (key `switch:0`), `/rpc/WiFi.GetStatus` from `Shelly.GetStatus` (key `wifi`). If the
-     * combined response does not contain the component, the original request is sent - so the
-     * result is always the same as before.
+     * Get the response for a poll url. Single component requests are answered from one combined
+     * request per cycle: `/rpc/Switch.GetConfig?id=0` from `Shelly.GetConfig` (key `switch:0`),
+     * `/rpc/WiFi.GetStatus` from `Shelly.GetStatus` (key `wifi`), and for Gen 1
+     * `/settings/relay/0` from `/settings` (`relays[0]`) and `/roller/0` from `/status`
+     * (`rollers[0]`). If the combined response does not contain
+     * the component, the original request is sent - so the result is always the same as before.
      *
      * @param url path of the request
      * @param cycle responses of the current poll cycle
@@ -854,6 +855,16 @@ export class BaseClient implements ShellyClient {
                     const key = `${match[1].toLowerCase()}${match[3] !== undefined ? `:${match[3]}` : ''}`;
                     if (all && typeof all === 'object' && all[key] !== undefined && all[key] !== null) {
                         return JSON.stringify(all[key]);
+                    }
+                }
+            } else {
+                // /settings/relay/N = /settings relays[N], /roller/N = /status rollers[N]
+                const match = /^(\/settings)?\/(relay|emeter|roller)\/(\d+)$/.exec(url);
+                if (match && (match[1] || match[2] === 'roller')) {
+                    const all = JSON.parse(await this.cachedRequest(match[1] ? '/settings' : '/status', cycle));
+                    const entry = all?.[`${match[2]}s`]?.[Number(match[3])];
+                    if (entry && typeof entry === 'object') {
+                        return JSON.stringify(entry);
                     }
                 }
             }

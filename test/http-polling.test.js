@@ -153,4 +153,27 @@ describe('HTTP polling', function () {
         await client.httpIoBrokerState();
         assert.deepStrictEqual(client.requests, ['/rpc/Shelly.GetStatus', '/rpc/Shelly.GetDeviceInfo']);
     });
+
+    it('Gen 1: answers /settings/relay/N, /settings/emeter/N and /roller/N from /settings and /status', async function () {
+        const responses = {
+            '/settings': { relays: [{ name: 'R0' }, { name: 'R1' }], emeters: [{ ctraf_type: 120 }] },
+            '/status': { relays: [{ ison: true }], rollers: [{ state: 'stop', current_pos: 40 }] },
+        };
+        const client = new TestClient(1, responses);
+        client.setPollUrls([
+            '/status',
+            '/settings',
+            '/settings/relay/1',
+            '/settings/emeter/0',
+            '/roller/0',
+            '/settings/ext_temperature/0',
+        ]);
+
+        await client.httpIoBrokerState();
+
+        assert.deepStrictEqual(client.requests.sort(), ['/settings', '/settings/ext_temperature/0', '/status']);
+        assert.deepStrictEqual(client.valueOf('/settings/relay/1'), { name: 'R1' });
+        assert.deepStrictEqual(client.valueOf('/settings/emeter/0'), { ctraf_type: 120 });
+        assert.deepStrictEqual(client.valueOf('/roller/0'), { state: 'stop', current_pos: 40 });
+    });
 });
